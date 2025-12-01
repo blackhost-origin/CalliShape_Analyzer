@@ -4,7 +4,7 @@
 
 **CalliShape Analyzer** 是一个专为中国书法分析设计的计算机视觉工具。它能够自动检测每一个汉字，绘制精准的边缘框，并根据“长、方、扁”的体势规则对汉字进行分类和着色标注。
 
-![Demo](https://via.placeholder.com/800x400?text=Place+Your+Result+Image+Here)
+![Demo]([https://via.placeholder.com/800x400?text=Place+Your+Result+Image+Here](https://github.com/blackhost-origin/CalliShape_Analyzer/blob/main/precise_calligraphy_boxes.jpg)
 *(Please replace this link with your actual result image / 请替换为你的实际运行结果图)*
 
 ## ✨ Key Features (核心功能)
