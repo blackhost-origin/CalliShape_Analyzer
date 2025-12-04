@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 
 def is_box_inside(inner, outer):
     """
@@ -11,103 +12,150 @@ def is_box_inside(inner, outer):
     ox, oy, ow, oh = outer
     return (ix >= ox) and (iy >= oy) and (ix + iw <= ox + ow) and (iy + ih <= oy + oh)
 
-def draw_precise_boxes(image_path):
-    # 读取图片
+def get_adaptive_kernel_size(binary_img, multiplier=3.5):
+    """
+    核心算法：根据图像内容的笔画宽度，动态计算最佳闭运算核大小。
+    """
+    contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    stroke_widths = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        perimeter = cv2.arcLength(cnt, True)
+        if area > 10 and perimeter > 10:
+            width = 2 * area / perimeter
+            stroke_widths.append(width)
+    
+    if not stroke_widths:
+        return (10, 10)
+
+    median_width = np.median(stroke_widths)
+    k_size = int(median_width * multiplier)
+    k_size = max(3, k_size) 
+    
+    print(f"📊 [自适应分析] 估算笔画宽度: {median_width:.2f} px")
+    print(f"🔧 [自适应分析] 动态设定 Kernel Size: ({k_size}, {k_size})")
+    
+    return (k_size, k_size)
+
+def process_calligraphy(image_path):
+    # 1. 读取图片
     img = cv2.imread(image_path)
     if img is None:
-        print(f"未找到图片: {image_path}")
+        print(f"❌ 未找到图片: {image_path}")
         return
 
-    result_img = img.copy()
+    print(f"📂 开始处理文件: {image_path}")
+    
+    # 准备两张画布：一张画框，一张画多边形
+    analyzer_img = img.copy() # 用于 _analyzer.jpg
+    shape_img = img.copy()    # 用于 _shape.jpg
     
     # 图像预处理
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # 使用 OTSU 二值化，自动寻找最适合区分墨迹和纸张的阈值
-    # 这一步比固定阈值更准，能更好得提取字迹
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # 使用【闭运算】连接断开的笔画
-    # 定义核心距离值（Kernel_size）：
-    # (10, 10) 这是一个关键参数，该参数是防止汉字部首被识别成多个汉字的关键参数，避免汉字被过度分割
-    # 算法实现：如果两个笔画距离在 10 像素以内，就认为它们属于同一个字，把它们连起来。
-    # 注意：这个值如果太大，会把上下两个字连起来；如果太小，左右结构的字会分家，这里需要自行调整  
-    kernel_size = (12, 12) 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_size)
+    # 适应获取 Kernel Size
+    adaptive_kernel = get_adaptive_kernel_size(binary)
     
-    # MORPH_CLOSE = 先膨胀后腐蚀。能闭合内部小孔和近距离的断裂，但保持轮廓大小基本不变。
-    closed_img = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    # 形态学闭运算 (连接笔画)
+    closed_img = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, 
+                                  cv2.getStructuringElement(cv2.MORPH_RECT, adaptive_kernel))
 
     # 查找轮廓
     contours, _ = cv2.findContours(closed_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # 收集所有候选框
-    boxes = []
-    min_area = 100 # 过滤掉噪点（太小的点）
+    # 收集候选数据
+    # 这里同时保存 轮廓(contour) 和 边界框(box)
+    candidates = []
+    min_area = adaptive_kernel[0] * adaptive_kernel[1] * 2 
     
     for cnt in contours:
         area = cv2.contourArea(cnt)
         if area > min_area:
             x, y, w, h = cv2.boundingRect(cnt)
-            boxes.append((x, y, w, h))
+            candidates.append({
+                'cnt': cnt,      # 原始轮廓数据 (用于画多边形)
+                'box': (x, y, w, h), # 矩形数据 (用于画框和去嵌套)
+                'area': area     # 面积 (用于排序)
+            })
 
-    # 除嵌套 (Nesting Removal) 如果一个框在另一个框里面，只保留大的，删掉小的
+    # 去除嵌套 (Nesting Removal)
+    # 按面积从大到小排序
+    candidates.sort(key=lambda c: c['area'], reverse=True)
     
-    # 先按面积从大到小排序，确保先处理大框
-    boxes.sort(key=lambda b: b[2] * b[3], reverse=True)
-    
-    keep = [True] * len(boxes)
-    for i in range(len(boxes)):
+    keep = [True] * len(candidates)
+    for i in range(len(candidates)):
         if not keep[i]: continue
-        for j in range(i + 1, len(boxes)):
-            if keep[j] and is_box_inside(boxes[j], boxes[i]):
-                keep[j] = False # 标记为删除（内部的小框）
+        for j in range(i + 1, len(candidates)):
+            # 检查 j 是否在 i 内部
+            if keep[j] and is_box_inside(candidates[j]['box'], candidates[i]['box']):
+                keep[j] = False 
 
-    final_boxes = [boxes[i] for i in range(len(boxes)) if keep[i]]
+    # 过滤后的最终列表
+    final_candidates = [candidates[i] for i in range(len(candidates)) if keep[i]]
 
-    # 绘制与着色
+    # 绘制逻辑
     count_long = 0
     count_square = 0
     count_flat = 0
 
-    for (x, y, w, h) in final_boxes:
-        # 在原图上绘制，注意：这里我们用的是原始坐标
-        # 因为 closed_img 只是用来找位置，并没有改变坐标系
-        
+    for item in final_candidates:
+        # --- 绘制矩形框 (_analyzer) ---
+        x, y, w, h = item['box']
         aspect_ratio = h / float(w)
         
         if aspect_ratio > 1.2:
             color = (0, 0, 255) # 红 (长)
             count_long += 1
-            label = "L"
         elif aspect_ratio < 0.8:
             color = (255, 0, 0) # 蓝 (扁)
             count_flat += 1
-            label = "F"
         else:
             color = (0, 255, 0) # 绿 (方)
             count_square += 1
-            label = "S"
+            
+        cv2.rectangle(analyzer_img, (x, y), (x + w, y + h), color, 2)
 
-        # 绘制矩形
-        cv2.rectangle(result_img, (x, y), (x + w, y + h), color, 2)
+        # --- 绘制围合多边形 (_shape) ---
+        # 使用 Convex Hull (凸包) 算法
+        # hull 是一组点，代表了包围该轮廓的最小凸多边形
+        cnt = item['cnt']
+        hull = cv2.convexHull(cnt)
+        
+        # 参数说明：画板, 轮廓数组, 轮廓索引(-1为所有), 颜色(红色), 线宽
+        cv2.drawContours(shape_img, [hull], -1, (0, 0, 255), 2)
+        
+        # 如果需要更平滑的效果，可以画出关键点（可选）
+        # for point in hull:
+        #     cv2.circle(shape_img, tuple(point[0]), 3, (0, 255, 0), -1)
 
-    # 输出统计与保存
+    # 输出结果与文件保存
     print("--- 处理完成 ---")
-    print(f"保留框总数: {len(final_boxes)}")
-    print(f"🔴 长形字 (>1.2): {count_long}")
-    print(f"🟢 方形字 (0.8-1.2): {count_square}")
-    print(f"🔵 扁形字 (<0.8): {count_flat}")
+    print(f"检测汉字总数: {len(final_candidates)}")
+    print(f"🔴 长形字: {count_long}, 🟢 方形字: {count_square}, 🔵 扁形字: {count_flat}")
 
-    output_path = "precise_calligraphy_boxes.jpg"
-    cv2.imwrite(output_path, result_img)
+    # 文件名处理
+    dir_name = os.path.dirname(image_path)
+    base_name, ext_name = os.path.splitext(os.path.basename(image_path))
     
-    # 显示结果
+    # 保存分析框图
+    output_analyzer = os.path.join(dir_name, f"{base_name}_analyzer{ext_name}")
+    cv2.imwrite(output_analyzer, analyzer_img)
+    print(f"✅ 框型图已保存: {output_analyzer}")
+
+    # 保存形状图 (新需求)
+    output_shape = os.path.join(dir_name, f"{base_name}_shape{ext_name}")
+    cv2.imwrite(output_shape, shape_img)
+    print(f"✅ 形状图已保存: {output_shape}")
+    
+    # 显示结果 (显示形状图预览)
     plt.figure(figsize=(12, 18))
-    plt.imshow(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB))
+    plt.title("Convex Hull Shape Analysis")
+    plt.imshow(cv2.cvtColor(shape_img, cv2.COLOR_BGR2RGB))
     plt.axis('off')
     plt.show()
 
 if __name__ == '__main__':
-    # 处理的图片文件
-    draw_precise_boxes('./20251201203533_88_145.jpg')
+    # 请在此处替换你的文件路径
+    process_calligraphy('./3.jpg')
